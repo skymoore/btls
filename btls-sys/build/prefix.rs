@@ -80,10 +80,12 @@ pub fn prefix_symbols(config: &Config) {
         _ => PathBuf::from("nm"),
     };
     let out = run_command(Command::new(nm).args(&static_libs)).unwrap();
+    // `V` (weak object: vtables, typeinfo) and `u` (GNU unique: C++ inline statics) are ELF-only
+    // kinds that C++ BoringSSL emits; without them two BoringSSL copies still collide.
     let types: &[&str] = if apple {
         &[" T ", " D ", " B ", " C ", " R ", " S ", " W "]
     } else {
-        &[" T ", " D ", " B ", " C ", " R ", " W "]
+        &[" T ", " D ", " B ", " C ", " R ", " W ", " V ", " u "]
     };
     let mut redefine_syms: Vec<String> = String::from_utf8_lossy(&out.stdout)
         .lines()
@@ -95,7 +97,11 @@ pub fn prefix_symbols(config: &Config) {
                 l.strip_prefix('_')
                     .map(|c| format!("_{c} _{PREFIX}_{c}"))
             } else {
-                (!l.starts_with('_')).then(|| format!("{l} {PREFIX}_{l}"))
+                // ELF C symbols have no leading `_`. Itanium-mangled C++ symbols (`_Z...`, the whole
+                // `bssl::` namespace, vtables, typeinfo) do; they must be prefixed too or the ssl/
+                // crypto C++ internals collide with another BoringSSL in the same binary — the
+                // Apple branch above already renames them via the stripped-underscore path.
+                (!l.starts_with('_') || l.starts_with("_Z")).then(|| format!("{l} {PREFIX}_{l}"))
             }
         })
         .collect();
