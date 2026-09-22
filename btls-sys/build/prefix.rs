@@ -55,21 +55,64 @@ fn apple_llvm_tool(name: &str) -> PathBuf {
     );
 }
 
+/// Locate an LLVM binutil on Windows: `$LLVM_<TOOL>` env, then PATH, then the directory of
+/// `$LIBCLANG_PATH` (bindgen already needs it), then the LLVM installer's default location.
+fn windows_llvm_tool(name: &str) -> PathBuf {
+    let env_key = name.replace('-', "_").to_uppercase();
+    if let Some(p) = std::env::var_os(&env_key) {
+        return PathBuf::from(p);
+    }
+    let exe = format!("{name}.exe");
+    if Command::new(&exe).arg("--version").output().is_ok() {
+        return PathBuf::from(exe);
+    }
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(p) = std::env::var_os("LIBCLANG_PATH") {
+        candidates.push(PathBuf::from(p).join(&exe));
+    }
+    candidates.push(PathBuf::from(r"C:\Program Files\LLVM\bin").join(&exe));
+    for p in candidates {
+        if p.exists() {
+            return p;
+        }
+    }
+    panic!(
+        "btls-sys `prefix-symbols` needs `{name}` on Windows: install LLVM (winget install LLVM.LLVM) or set ${env_key} to its path"
+    );
+}
+
 pub fn prefix_symbols(config: &Config) {
-    // List static libraries to prefix symbols in
-    let static_libs: Vec<PathBuf> = [
+    let windows = config.target_os == "windows";
+
+    // List static libraries to prefix symbols in. CMake's multi-config generators (MSVC) put
+    // them under a configuration subdirectory (`Debug`, `Release`, …) and name them `ssl.lib`.
+    let mut dirs: Vec<PathBuf> = vec![
         config.out_dir.join("build"),
         config.out_dir.join("build").join("ssl"),
         config.out_dir.join("build").join("crypto"),
-    ]
-    .iter()
-    .flat_map(|dir| {
-        ["libssl.a", "libcrypto.a"]
-            .into_iter()
-            .map(move |file| PathBuf::from(dir).join(file))
-    })
-    .filter(|p| p.exists())
-    .collect();
+    ];
+    if windows {
+        for sub in ["Debug", "Release", "RelWithDebInfo", "MinSizeRel"] {
+            dirs.push(config.out_dir.join("build").join(sub));
+            dirs.push(config.out_dir.join("build").join("ssl").join(sub));
+            dirs.push(config.out_dir.join("build").join("crypto").join(sub));
+        }
+    }
+    let names: &[&str] = if windows {
+        &["ssl.lib", "crypto.lib", "libssl.a", "libcrypto.a"]
+    } else {
+        &["libssl.a", "libcrypto.a"]
+    };
+    let static_libs: Vec<PathBuf> = dirs
+        .iter()
+        .flat_map(|dir| names.iter().map(move |file| dir.join(file)))
+        .filter(|p| p.exists())
+        .collect();
+    assert!(
+        !static_libs.is_empty(),
+        "btls-sys `prefix-symbols`: no ssl/crypto static libraries found under {}",
+        config.out_dir.join("build").display()
+    );
 
     let apple = matches!(&*config.target_os, "macos" | "ios");
 
@@ -77,6 +120,7 @@ pub fn prefix_symbols(config: &Config) {
     let nm = match &*config.target_os {
         "android" => android_toolchain(config).join("llvm-nm"),
         _ if apple => apple_llvm_tool("llvm-nm"),
+        _ if windows => windows_llvm_tool("llvm-nm"),
         _ => PathBuf::from("nm"),
     };
     let out = run_command(Command::new(nm).args(&static_libs)).unwrap();
@@ -96,6 +140,12 @@ pub fn prefix_symbols(config: &Config) {
                 // Mach-O C symbols carry a leading `_`; anything else is linker-local.
                 l.strip_prefix('_')
                     .map(|c| format!("_{c} _{PREFIX}_{c}"))
+            } else if windows {
+                // COFF x64: C symbols carry no leading `_`; MSVC-mangled C++ names start with `?`
+                // (`?…@bssl@@…`). Names starting with `_` are CRT/compiler symbols (`_fltused`,
+                // `__security_cookie`) and stay. The linker treats names as opaque strings, so a
+                // prefixed mangled name is fine as long as every object in the archive agrees.
+                (!l.starts_with('_')).then(|| format!("{l} {PREFIX}_{l}"))
             } else {
                 // ELF C symbols have no leading `_`. Itanium-mangled C++ symbols (`_Z...`, the whole
                 // `bssl::` namespace, vtables, typeinfo) do; they must be prefixed too or the ssl/
@@ -119,6 +169,7 @@ pub fn prefix_symbols(config: &Config) {
     let objcopy = match &*config.target_os {
         "android" => android_toolchain(config).join("llvm-objcopy"),
         _ if apple => apple_llvm_tool("llvm-objcopy"),
+        _ if windows => windows_llvm_tool("llvm-objcopy"),
         _ => PathBuf::from("objcopy"),
     };
     for static_lib in &static_libs {
