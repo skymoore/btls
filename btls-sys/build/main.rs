@@ -661,20 +661,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if config.features.prefix_symbols {
-        match config.target_os.as_str() {
-            "windows" => {
-                println!(
-                    "cargo:warning=The `prefix_symbols` feature is not supported on Windows targets. Skipping symbol prefixing."
-                );
-            }
-            _ => {
-                // Symbol prefixing requires the 'nm' tool which is not available in the docs.rs
-                // build environment. When building documentation, symbol prefixing is skipped.
-                // For regular builds, this operation is costly and only performed when necessary.
-                if !config.env.docs_rs {
-                    prefix_symbols(&config)
-                }
-            }
+        // Symbol prefixing requires `nm`/`objcopy` (LLVM's on Apple and Windows targets), which the
+        // docs.rs build environment lacks; when building documentation it is skipped. For regular
+        // builds it runs on every target — the generated bindings reference the prefixed names, so
+        // skipping it (as this crate once did on Windows) leaves every `btls_sys_*` unresolved.
+        if !config.env.docs_rs {
+            prefix_symbols(&config)
         }
     }
     generate_bindings(&config).map_err(|e| format!("could not generate bindings: {e}"))?;
